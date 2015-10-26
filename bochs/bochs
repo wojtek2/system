@@ -1,0 +1,12 @@
+make clean
+./configure --host=x86_64-unknown-linux-gnu \
+	    --build=x86_64-unknown-linux-gnu \
+	    --target=x86_64-unknown-linux-gnu \
+	    --with-all-libs \
+	    --enable-cdrom \
+	    --enable-fpu \
+
+make 
+make install
+
+

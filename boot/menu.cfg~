@@ -1,0 +1,5 @@
+title MyOS
+        root    (fd0)
+        kernel  /kernel.elf
+        default
+        timeout 0

@@ -1,0 +1,311 @@
+;********************************************************************************************************************
+;*                                      floppy.asm                                                                  *
+;*                                      Autor:Gandzia40                                                             *
+;*                                      e-mail:Gandzia40@wp.pl                                                      *
+;*                                      0.1                                                                         *
+;*                                      2012                                                                        *
+;********************************************************************************************************************
+; Program rozruchowy umieszczany w pierwszym sektorze dysku. Wczytuje plik o podanej nazwie pod wskazany adres, a nas
+; têpnie przekazuje mu sterowanie, pocz¹wszy od drugiego bajtu tego¿ pliku.
+; Program posiada dodatkowe funkcje wkompilowywane w zale¿noœci od podanych dyrektyw preprocesora:
+;  - wyœwietlenie tekstu powitalnego ³¹cznie z formatowaniem w zale¿noœci od dyrektywy
+;  - za³adowanie pliku o podanej nazwie pod wskazany adres
+;  - sprawdzenie, czy plik zawiera na pocz¹tku sekwencjê 0xAA55 w zale¿noœci od dyrektywy
+;  - wyœwietlenie trzech ró¿nych tekstów z formatowaniem w razie b³êdów: braku pliku, odczytu, b³edu w pliku (braku sekwencji
+;    0xAA55 )i reset CPU b¹dŸ ponowienie próby rozruchu (wyw³oanie int 0x19) w zale¿noœci od dyrektywy
+; Program zosta³ przygotowany dla kompilatora NASM
+; Maksymalna wielkoœæ pliku do wczytania to 64 KB
+; ZWRACANE:
+; Po poprawnym za?adowaniu pliku i skoku adres gdzie za?adowano plik zawarty jest w rejestrach AX:BX
+;---------------------------------------------------------------------------------------------------------------
+;SPIS TREŒCI:                                       |NR. LINII
+;---------------------------------------------------------------------------------------------------------------
+;1.Metka i podstawowy opis                          | 1
+;2.Definicje wkompilowuj¹ce kod                     |
+;Definicje wkompilowuj¹ce kod:
+
+%DEFINE Welcome 'ON' ;Czy wyœwietlaæ tekst powitalny, ON - tekst bêdzie wyœwietlany, OFF - nie. Tekst w zmiennej WelcomeText
+%DEFINE WelcomeFormat 7 ; Format tekstu powitania
+%DEFINE CheckAA55 'OFF' ; Czy sprawdzaæ obecnoœæ s³owa 0xAA55, ON-tak, OFF-nie
+%DEFINE ResetIfError 'ON' ; Czy uruchamiaæ ponownie komputer w razie wyst¹pienia b³êdu. ON - komputer bêdzie uruchamiany ponownie
+                         ; OFF - po wyst¹pieniu b³êdu bêdzie ponowiona próba rozruchu (int 0x19)
+%DEFINE ErrorFormat  0x8C   ; Format tekstu b³êdu.
+
+;DEFINE:
+
+;Adres pod który zostanie wczytany plik:
+%DEFINE DestinationSegment 0x0050  ;Segment
+%DEFINE DestinationOffset 0 ;Offset
+
+%DEFINE BufferOffset 0x201 ; Offset wzglêdem segmentu 0x7C0, w którym bêdzie siê znajdowa³ bufor na dane potrzebne do obs³ugi FAT
+
+[ORG 0]
+start:
+ jmp SetRegs
+ OSName db 'GADAOS  '             ; 8 znakowa nazwa systemu operacyjnego. Nie wykorzystane znaki nale¿y zape³niæ spacjami
+ BytesPerSector dw 0x200          ; Liczba bajtów na sektor
+ SectorPerCluster db 0x1          ; Liczba sektorów na klaster
+ ReservedSectors dw 0x1           ; Liczba zarezerwowanych sektorów
+ FATn            db 0x2           ; Liczba tablic FAT
+ MaxElInRoot     dw 0x0E0         ; Maksymalna liczba elementów w katalogu g³ównym
+ AllSectors      dw 0x0B40        ; Liczba wszystkich sektorów
+ MDB             db 0x0F0         ; Bajt deskryptora noœnika
+ SectorPerFAT    dw 9             ; Liczba sektorów na tablice FAT
+ SectorPerTrack  dw 0x12         ; Liczba sektorów na œcie¿kê
+ Heads           dw 0x2          ; Licbza g³owic
+ HiddenSectors   dd 0             ; Liczba ukrytych sektorów
+ AllSect32MB     dd 0             ; Liczba sektorów, je¿eli wolumin jest wiêkszy od 32 MB
+ DriveNum        db 0             ; Numer napêdu
+ Reserved        db 0             ; Pole zarezerwowane
+ ExtSig          db 0x29          ; Rozszerzona sygnatura sektora rozruchowego
+ SerialNumber    dd 0x0FFFFFFFF   ; Numer seryjny woluminu
+ DiskLabel       db 'NAZWA_VOLUM' ; 11 znakowa etykieta woluminu.Niewykorzystane znaki zast¹piæ spacjami
+ FSName          db 'FAT12   '    ; 8 znakowa nazwa systemu plików. Niewykorzystane znaki zast¹piæ spacjami
+
+ ;Procedury programu:
+ ;----------------------------------------------------------------------------------------------------------------------------------------------
+ ReadCluster: ;Procedura obliczaj¹ca adres C,H,S klastra i wczytuj¹ca go.
+ ;PARAMETRY:
+ ;DX - numer klastra
+ ;ES:BX - adres gdzie ma zostaæ wczytany
+  push bx
+  mov ax, dx
+  mov bx, dx
+  xor dx, dx
+  mov cx, [SectorPerTrack]
+  div cx
+  inc dx
+  push dx
+  xor dx, dx
+  mov cx, [Heads]
+  div cx
+  pop cx
+  mov ch, al
+  mov dh, dl
+  xor dl, dl
+  pop bx
+  Call ReadSector
+  ret
+
+ CmpText: ; Funkcja porównuj¹ca dwa ³añcuchy zakoñczone 0, i zwracaj¹ca 1 gdy s¹ takie same b¹dŸ 0 gdy ró¿ne.Nie uwzglêdnia wielkoœci liter
+ ;PARAMETRY:
+ ;DS:SI,ES:DI - adresy ci¹gów zakoñczonych 0 do porównania
+ ;CX - iloœæ znaków do porównania, 0 - porównanie a¿ do wyst¹pienia koñca w dowolnym z ³añcuchów
+ ;ZWRACANE:
+ ;  CF=0 -ci¹gi ró¿ne
+ ;  CF=1 - ci¹gi takie same
+ cld
+ repe cmpsb
+ jne .NotEqu
+ stc
+ ret
+ .NotEqu:
+ clc
+ ret
+
+ ;-------------------------------------------------------------------------------------------------------------------
+
+ printf: ; Procedura wyœwietlaj¹ca tekst na ekaranie. W DS:SI adres ze zmienn¹ zawieraj¹c¹ tekst do wyœwietlenia zakoñczony 0, w BL format tresktu
+  .PrintfLoop:
+   mov ah,0xE ;Funkcja wyœwietlaj¹ca znak
+   mov al,[ds:si] ;Pobranie kodu znaku do rejestru AL
+   cmp al,0
+   je .PrintfEnd
+   mov bh,0
+   int 0x10
+   inc si
+   jmp .PrintfLoop
+  .PrintfEnd:
+   ret
+ ;-------------------------------------------------------------------------------------------------------------------
+ ErrorProc: ;Procedura obs³ugi b³êdów, wyœwietla tekst i podejmuje dalsze kroki w zale¿noœci od dyrektywy "ResetIfError". W DS:SI tekst b³êdu
+  mov bl,ErrorFormat
+  call printf
+  mov ax,0
+  int 0x16
+  %IFIDN <ResetIfError>,<'ON'>
+    mov al,0x0FE
+    out 0x64,al
+    hlt
+  %ELSE
+    mov ax,0
+    int 0x19
+  %ENDIF
+ ;-------------------------------------------------------------------------------------------------------------------
+ ReadSector: ; Procedura odczytuj¹ca sektory z dysku. W CH - numer œcie¿ki w CL - numer sektora DH - numer g³owicy ES:BX - adres gdzie sektor ma byæ wczytany
+  push ax
+  mov ah,0x2
+  mov al,1
+  mov dl,0
+  int 0x13
+  jc .ReadSectorError
+  pop ax
+  ret
+  .ReadSectorError:
+
+  mov si,IOErrorText
+  call ErrorProc
+  ;-------------------------------------------------------------------------------------------------------------------
+  ;-------------------------------------------------------------------------------------------------------------------
+
+
+  SetRegs: ;Ustawienie rejestrów segmentowych na poprawne dla programu
+   mov ax,0x7C0
+   mov ds,ax
+   mov es,ax
+   mov ss,ax
+   mov sp,0xFFFF
+   push 0x7c0
+   push begin
+
+   retf ;Skok do g³ównego kodu programu, poprzez daleki powrót z procedury.Parametry od³o¿one na stosie powy¿ej
+  begin:;G³ówny kod programu:
+   %IFIDN <Welcome>,<'ON'>
+    mov si,WelcomeText
+    mov bl,WelcomeFormat
+    call printf
+    
+   %ENDIF
+   ; Poszukiwanie w katalogu g³ównym pliku o podanej nazwie
+   ;Wczytanie  pierwszego sektora z katalogiem g³ównym
+   mov cx,2
+   mov dh,1
+   mov bx,BufferOffset
+   Call ReadSector
+   mov ax,0
+   .FindFileLoop: ;Pêtla poszukiwawcza. W AX - numer aktualnie przetwarzanego wpisu w aktualnie przetwarzanym sektorze
+                  ;                            katalogu g³ównego (max 15)
+                  ;                     W Cl - numer aktualnie wczytanego sektora katalogu g³ównego (2-15)
+     ;obliczenie pozycji aktualnego wpisu w buforze, wpis ma 32 bajty, wiec mno¿ymy AX przez 32
+     push ax
+     push cx
+     mov bx,32
+     mul bx
+     ;Porównanie nazwy pliku:
+     mov si,FileName
+     mov di,ax
+     add di,BufferOffset
+     mov cx,8
+     push di
+     Call CmpText
+     pop di
+     jne .FindFileLoopNext ;Je¿eli nazwa nie jest t¹ nazw¹, przejœcie do przetwarzania nastêpnego wpisu
+     ;Porówanie rozszerzenia pliku:
+     mov si,FileName+9
+     add di,0x8
+     mov cx,3
+     push di
+     Call CmpText
+     jne .FindFileLoopNext ;Je¿eli nie to rozszrzenie, przejœcie do przetwarzania nastêpnego wpisu
+     pop di
+     mov di,BufferOffset
+     add di,0x1A
+     add di,ax
+     mov dx,[ds:di] ; W DX numer pierwszego klastra
+     jmp .LoadFile ;Je¿eli program doszed³ do tego momentu, oznacza to ¿e plik o podanej nazwie zosta³ znaleziony, i przejœcie do procedury jego za³adowania
+
+     .FindFileLoopNext:
+       pop cx
+       pop ax
+       inc ax
+       cmp ax,16 ;Je¿eli przetworzono ju¿ wszystkie wpisy w aktualnym sektorze, przejscie do zaladowania nastepnego
+       je .FindFileLoopLoadNextSector
+       jmp .FindFileLoop
+
+     .FindFileLoopLoadNextSector:
+       inc cl
+       cmp cl,16 ;Je¿eli numer nastêpnego sektora do wczytania to 16, oznacza to ¿e przetworzyliœmy ju¿ wszystkie sektory przeznaczone na katalog g³ówny i
+                 ;plik nie zosta³ odnaleziony
+       je .FileNotFound
+       ;Wczytanie nastêpnego sektora
+       mov ch,0
+       mov dh,1
+       mov bx,BufferOffset
+       Call ReadSector
+       mov ax,0
+       jmp .FindFileLoop
+   .FileNotFound:
+     mov si,FileNotFoundText
+     call ErrorProc
+
+   .LoadFile:
+      
+      push dx
+      mov cx,2
+      mov bx,BufferOffset
+      .LoadFatLoop: ;pêtla wczytuj¹ca ca³¹ tablicê FAT pod adres wskazany przez CS:BufferOffset
+       mov dh,0
+       Call ReadSector
+       inc cl
+       add bx,512
+       cmp cl,11
+       jne .LoadFatLoop
+      pop dx
+      push DestinationSegment
+      pop es
+      mov bx,DestinationOffset
+      .LoadFileLoop:
+        ;Odczytanie podanego klastra z dysku
+        cmp dx,0xFF7 ; Je¿eli wiêksze, oznacza to koniec pliku
+        jae .GoToFile ; Przejœcie do procedury, która odda sterowanie wczytanemu plikowi
+        push dx
+        add dx,31
+        Call ReadCluster;
+        add bx,512
+        pop dx
+        ;Odczytanie numeru nastêpnego klastra z tablicy FAT.
+        mov ax,dx
+        shr dx,1 ; Obliczenie numeru pozycji w której zapisany jest nastêpny numer klastra. Aktualny numer klastra to numer pozycji gdzie zapisany jest numer nastêpnego klastra.
+                 ; poniewa¿ pozycje zajmuj¹ 12 bitów, czyli 1,5 bajta, nale¿y przemno¿yæ aktualny numer klastra przez 1.5, przesuniêcie o jeden bit w prawo dokonuje tego.
+        add dx,ax
+        mov si,dx
+        mov dx,0
+        mov di,2
+        div di ; W poprzednim kroku wczytaliœmy 16 bitów numeru klastra, a numer klastra ma 12 bitów, wiêc pozosta³e bity trzeba przesun¹æ lub wyzerowaæ, w zale¿noœci czy numer aktualnego klastra jest parzysty czy nie
+        mov ax,[ds:si+BufferOffset] ;Odczytanie numeru nastêpnego klastra
+        cmp dx,0
+        je .Parrity
+
+        .NotParrity: ;Nie parzysty, przesuniêcie numeru nastêpnego klastra w prawo o 4
+         shr ax,4
+         mov dx,ax
+         jmp .LoadFileLoop
+        .Parrity: ;Parzysty, numer nastêpnego klastra AND 0xFFF
+         and ax,0xFFF
+         mov dx,ax
+         jmp .LoadFileLoop
+
+   .GoToFile: ; Procedura oddaj¹ca sterowanie wczytanemu plikowi
+    mov ax,0 ;Reset kontrolera FDD, m.in wy??cza silnik i gasi diod? LED
+    mov dx,0 
+    int 0x13
+    mov si,JumpText
+    mov bl,WelcomeFormat
+    call printf
+    mov bx,DestinationOffset
+    %IFIDN <CheckAA55>,<'ON'> ; Je¿eli w³¹czone sprawdzanie 0xAA55
+     mov ax,[es:DestinationOffset]
+     mov bx,push DestinationOffset+2
+     cmp ax,0xAA55
+     je .Jump
+     mov si,FileNotFoundText
+     Call ErrorProc
+    %ENDIF
+    .Jump:
+     mov ax, DestinationSegment     
+     push DestinationSegment
+     push bx     
+     retf
+
+   ;ZMIENNE PROGRAMU:
+   %IFIDN <Welcome>,<'ON'>
+    WelcomeText db 'Booting...',10,13,0 ; Zmienna z tekstem powitalnym, musi byæ zakoñczona 0
+   %ENDIF
+   IOErrorText  db 'I/O Error.Press any key to reset',0 ;Zmienna z tekstem b³êdu odczytu
+   JumpText	db 'Jump',10,13,0
+   FileNotFoundText db 'File not found.Press any key to reset',0 ;Zmienna z tekstem b³êdu braku pliku
+   FileName db 'KERNEL  .BIN' ;12 znakowa (11 znaków nazwy + obowi¹zkowo kropka) nazwa pliku do odnalezienia
+
+times 510 - ($-start) db 0 ;Dope³nienie zerami do 510 bajtów
+db 0x55
+db 0xAA
